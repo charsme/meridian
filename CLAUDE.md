@@ -223,4 +223,4 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 ---
 
 ## Known Issues / Tech Debt
-- `get_wallet_positions` tool (dlmm.js) is in definitions.js but not in MANAGER_TOOLS or SCREENER_TOOLS — only available in GENERAL role.
+- _None._ `get_wallet_positions` is intentionally GENERAL-only — it inspects arbitrary external wallets for chat use, not the agent's own wallet (that's `get_my_positions`).
