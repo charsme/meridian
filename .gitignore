@@ -33,6 +33,7 @@ CONTEXT.md
 dev-blocklist.json
 docs/*
 !docs/lorekeeper-integration.md
+!docs/containerization.md
 
 # Discord listener queue
 discord-signals.json

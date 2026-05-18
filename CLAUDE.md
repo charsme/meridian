@@ -231,6 +231,8 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ### Containerize (Dockerfile + docker-compose)
 
+**Full spec parked at `docs/containerization.md`.** Operator-confirmed decisions: volume `/data/volume/meridian`, logs `/data/logs/meridian`, no external HTTP / no Traefik, discord-listener as sibling container, trader 2G/1.5G CPU 1.5, listener 512M/256M CPU 0.5, base `node:20-bookworm-slim`, `tini` PID 1 (no PM2), `envcrypt.js` + separate `ENVCRYPT_KEY` file, TZ `Asia/Jakarta`, image tag = git short SHA. Open items inside the spec are flagged `[REVIEW]` — read those before implementing.
+
 Currently runs native (Node 18+ via PM2, see `ecosystem.config.cjs`). To containerize cleanly, the following constraints must be addressed:
 
 **Persistent state — must be volume-mounted, not baked into image:**
