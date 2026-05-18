@@ -35,8 +35,8 @@ Decisions confirmed with operator on 2026-05-18 are tagged `[CONFIRMED]`. Defaul
 | Discord listener layout | Separate container in same compose stack `[CONFIRMED]` |
 | Trader memory limit | 2G hard / 1.5G soft `[CONFIRMED]` |
 | Discord listener limits | 512M hard / 256M soft, 0.5 CPU `[CONFIRMED]` |
-| Wallet secret delivery | `envcrypt.js` encrypted `.envrypt` + `ENVCRYPT_KEY` passphrase `[CONFIRMED]` |
-| `ENVCRYPT_KEY` delivery | Separate plain `.env` on host (`/data/volume/meridian/.envrypt-key.env`), mounted via `env_file`. File mode 600. `[CONFIRMED]` |
+| Wallet secret delivery | Plain `.env` mounted from host. `envcrypt.js` available as future hardening (see §9). `[CONFIRMED 2026-05-18 round 4]` after CLI shape verification |
+| Encrypted-env passphrase delivery | N/A for v1 (plain .env). When hardening: `ENVCRYPT_KEY` env var via compose `environment:`. |
 | Base image | `node:20-bookworm-slim` `[CONFIRMED]` |
 | Process supervisor | Drop PM2. `tini` as PID 1, `node index.js` as child. `[CONFIRMED]` |
 | Timezone | `Asia/Jakarta` (WIB, UTC+7) `[CONFIRMED]` |
@@ -56,7 +56,7 @@ These are necessary to write the spec but not previously discussed. ELEVATE if a
 | Compose project name | `meridian` | Stack name in `docker compose -p meridian`. |
 | Container network | Single bridge network `meridian-net` | Internal-only. Trader ↔ listener both attached. No port publishing. |
 | Log driver | `json-file` with `max-size=20m`, `max-file=5` | Docker-side rotation. App-side daily rotation in `logs/` is the canonical log; container stderr/stdout caps prevent runaway disk on json-file. |
-| Healthcheck | `node -e "const s = require('fs').statSync('state.json'); if (Date.now() - s.mtimeMs > 30 * 60 * 1000) process.exit(1);"` every 60s, timeout 10s, start-period 90s, retries 3 | Asserts `state.json` mtime within last 30 min. Cron writes it on every management cycle, so a stuck process surfaces. |
+| Healthcheck | `node docker/healthcheck.js` every 60s, timeout 10s, start-period 90s, retries 3 | Reads `managementIntervalMin` from `/data/user-config.json` and treats `state.json` as stale if mtime exceeds `max(2 × managementIntervalMin, 30) min`. Operator override via `HEALTHCHECK_STALE_MIN` env. See §5 for script. |
 | Anchor patch | Run during builder stage after `npm ci` | Patches `node_modules/@coral-xyz/anchor`; output copied into runtime. |
 | node_modules in runtime | Copied from builder; runtime does NOT re-run `npm ci` | Reproducibility; smaller runtime image. |
 
@@ -79,8 +79,9 @@ These are necessary to write the spec but not previously discussed. ELEVATE if a
 ├── decision-log.json
 ├── hivemind-cache.json
 ├── discord-signals.json          # written by listener, read by trader (shared between containers)
-├── .envrypt                      # encrypted env blob, owner mode 600
-└── .envrypt-key.env              # ENVCRYPT_KEY=... only, owner mode 600
+└── .env                          # plain dotenv file, owner mode 600
+                                  # (when hardened: mixed plaintext + base64 entries
+                                  #  with `# encrypted` markers, plus ENVRYPT_KEY env or /data/.envrypt key file)
 
 /data/logs/meridian/
 ├── agent-YYYY-MM-DD.log          # daily-rotating, written by logger.js
@@ -94,8 +95,10 @@ sudo mkdir -p /data/volume/meridian /data/logs/meridian
 sudo chown -R 1000:1000 /data/volume/meridian /data/logs/meridian   # container UID
 sudo chmod 700 /data/volume/meridian
 sudo chmod 755 /data/logs/meridian
-# place .envrypt (encrypted) and .envrypt-key.env (with ENVCRYPT_KEY=) into /data/volume/meridian
-sudo chmod 600 /data/volume/meridian/.envrypt /data/volume/meridian/.envrypt-key.env
+
+# Plain .env (v1 default). When hardening later, see §9.
+sudo install -m 600 -o 1000 -g 1000 /dev/null /data/volume/meridian/.env
+sudoedit /data/volume/meridian/.env   # paste WALLET_PRIVATE_KEY, RPC_URL, OPENROUTER_API_KEY, etc
 ```
 
 ---
@@ -155,9 +158,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER meridian
 
-# Healthcheck against state.json freshness
+# Healthcheck — reads managementIntervalMin from /data/user-config.json + env override
 HEALTHCHECK --interval=60s --timeout=10s --start-period=90s --retries=3 \
-  CMD node -e "const s=require('fs').statSync('/data/state.json'); if(Date.now()-s.mtimeMs>1800000)process.exit(1);" || exit 1
+  CMD node /app/docker/healthcheck.js || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["node", "index.js"]
@@ -165,29 +168,16 @@ CMD ["node", "index.js"]
 
 ### entrypoint.sh
 
-Decrypts `.envrypt` using `ENVCRYPT_KEY`, then symlinks cwd-relative state files to the volume.
+Symlinks cwd-relative state files + `.env` + `logs/` to the persistent volume. No decryption step — `envcrypt.js` runs automatically at `index.js` module load via `import "./envcrypt.js"` (see `index.js:1`) and decrypts marked entries in-process.
 
 ```sh
 #!/usr/bin/env sh
 set -eu
 
-# 1. Decrypt env into process env. envcrypt.js exports decrypted KEY=VAL pairs.
-if [ -z "${ENVCRYPT_KEY:-}" ]; then
-  echo "FATAL: ENVCRYPT_KEY not set" >&2
-  exit 1
-fi
-if [ ! -f /data/.envrypt ]; then
-  echo "FATAL: /data/.envrypt missing" >&2
-  exit 1
-fi
-
-# Source the decrypted vars. envcrypt.js prints `export KEY=VAL` lines.
-eval "$(node /app/envcrypt.js decrypt --file /data/.envrypt --key "$ENVCRYPT_KEY" --format export)"
-unset ENVCRYPT_KEY   # passphrase no longer needed in process env
-
-# 2. Wire cwd-relative state file paths to the persistent volume.
-# These names match the const declarations in state.js / lessons.js / pool-memory.js / etc.
 cd /app
+
+# 1. Wire cwd-relative state file paths to the persistent volume.
+# These names match the const declarations in state.js / lessons.js / pool-memory.js / etc.
 for f in state.json lessons.json pool-memory.json strategy-library.json \
          smart-wallets.json token-blacklist.json deployer-blacklist.json \
          dev-blocklist.json signal-weights.json decision-log.json \
@@ -196,15 +186,61 @@ for f in state.json lessons.json pool-memory.json strategy-library.json \
   ln -sfn "/data/$f" "/app/$f"
 done
 
+# 2. dotenv reads from cwd ./.env (envcrypt.js DEFAULT_ENV_PATH = path.join(cwd, ".env")).
+ln -sfn /data/.env /app/.env
+
 # 3. Logger writes to ./logs. Symlink to persistent log volume.
 rm -rf /app/logs
 ln -sfn /var/log/meridian /app/logs
 
-# 4. Hand off to node.
+# 4. Hand off to node. envcrypt.js loadEnv() runs automatically at import time.
 exec "$@"
 ```
 
-`[REVIEW]` `envcrypt.js` must support a `decrypt --file --key --format export` invocation. If it doesn't, ELEVATE — entrypoint needs adjusting OR add a thin wrapper script. Do NOT assume the CLI shape.
+### docker/healthcheck.js
+
+```js
+#!/usr/bin/env node
+import fs from "fs";
+
+const STATE_PATH = "/data/state.json";
+const CONFIG_PATH = "/data/user-config.json";
+
+function readIntervalMin() {
+  // Env override wins. Default fallback is 30 min until config exists.
+  const override = Number(process.env.HEALTHCHECK_STALE_MIN);
+  if (Number.isFinite(override) && override > 0) return override;
+
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+    const mi = Number(cfg.managementIntervalMin ?? cfg.schedule?.managementIntervalMin);
+    if (Number.isFinite(mi) && mi > 0) {
+      // Stale window = 2× management interval, floored at 30 min so short cycles don't false-positive on a slow tick.
+      return Math.max(mi * 2, 30);
+    }
+  } catch {
+    /* missing or unreadable config — fall through to default */
+  }
+  return 30;
+}
+
+function main() {
+  let stat;
+  try {
+    stat = fs.statSync(STATE_PATH);
+  } catch {
+    // Until first management cycle writes state.json, allow the start-period to cover it.
+    process.exit(1);
+  }
+  const staleMs = readIntervalMin() * 60 * 1000;
+  if (Date.now() - stat.mtimeMs > staleMs) process.exit(1);
+  process.exit(0);
+}
+
+main();
+```
+
+`[CONFIRMED]` `envcrypt.js` CLI shape verified 2026-05-18. Module exports `loadEnv()` and auto-runs it on import (`envcrypt.js:121`). `index.js:1`, `cli.js:7`, `setup.js:7` all import it. Encryption model = per-key inline at module load, NOT whole-file external decryption. v1 spec uses plain `.env`; encryption is opt-in hardening (see §9).
 
 ---
 
@@ -264,10 +300,14 @@ services:
       dockerfile: Dockerfile
     container_name: meridian-trader
     restart: unless-stopped
-    env_file:
-      - /data/volume/meridian/.envrypt-key.env   # contains ENVCRYPT_KEY=...
+    # NOTE: do NOT set env_file here. dotenv reads /app/.env at runtime
+    # (symlinked to /data/.env by entrypoint). Putting it under env_file
+    # would double-load + bypass envcrypt decryption on encrypted entries.
     environment:
       TZ: Asia/Jakarta
+      NODE_OPTIONS: "--max-old-space-size=1536"
+      # HEALTHCHECK_STALE_MIN: 60     # uncomment to override default 2×managementIntervalMin
+      # ENVRYPT_KEY: "${ENVRYPT_KEY}" # ONLY when hardening (§9). Pass-through from host shell.
     volumes:
       - /data/volume/meridian:/data:rw
       - /data/logs/meridian:/var/log/meridian:rw
@@ -297,12 +337,11 @@ services:
       dockerfile: discord-listener/Dockerfile
     container_name: meridian-discord-listener
     restart: unless-stopped
-    env_file:
-      - /data/volume/meridian/.envrypt-key.env   # same key; listener can decrypt its own subset
+    # Listener reads its own subset of env from /data/.env (mounted below).
     environment:
       TZ: Asia/Jakarta
     volumes:
-      - /data/volume/meridian:/data:rw           # shared discord-signals.json
+      - /data/volume/meridian:/data:rw           # shared discord-signals.json + .env
       - /data/logs/meridian:/var/log/meridian:rw
     networks:
       - meridian-net
@@ -361,22 +400,54 @@ This keeps V8 heap under the soft reservation, leaving 512MB for buffers, native
 
 ## 9. Secret Handling
 
-### Files on host
-- `/data/volume/meridian/.envrypt` — encrypted blob containing `WALLET_PRIVATE_KEY`, `RPC_URL`, `OPENROUTER_API_KEY`, optional `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `HELIUS_API_KEY`, `HIVE_MIND_URL`, `HIVE_MIND_API_KEY`. Mode 600.
-- `/data/volume/meridian/.envrypt-key.env` — single line `ENVCRYPT_KEY=...`. Mode 600. Mounted as `env_file`.
+### v1 default — plain `.env`
 
-### Flow
-1. Compose mounts `.envrypt-key.env` → container env has `ENVCRYPT_KEY`.
-2. `entrypoint.sh` calls `node envcrypt.js decrypt` to recover the plaintext env into the process.
-3. `entrypoint.sh` unsets `ENVCRYPT_KEY` from process env to avoid leak through `/proc/self/environ`.
-4. `exec node index.js` — node sees all required env vars, no on-disk plaintext.
+- `/data/volume/meridian/.env` — plain dotenv file, mode 600, UID/GID 1000.
+- Mounted into the container via the `/data/volume/meridian → /data` bind mount.
+- `entrypoint.sh` symlinks `/data/.env → /app/.env` so dotenv (which `envcrypt.js` calls with `DEFAULT_ENV_PATH = path.join(cwd, ".env")`) finds it.
+- `index.js:1` imports `envcrypt.js` → `loadEnv()` runs → dotenv populates `process.env`. No marked-encrypted entries → no passphrase needed → boots.
 
-### Risks
-- Both files on the same host filesystem — defense in depth is limited. Attacker with host root reads both.
-- Image layer never contains either file (only mounted at runtime).
-- `docker inspect` will reveal `env_file` source path but NOT contents.
+Required entries (mirror existing `.env.example`):
+```
+WALLET_PRIVATE_KEY=...
+RPC_URL=https://...
+OPENROUTER_API_KEY=...
+# optional
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+HELIUS_API_KEY=...
+HIVE_MIND_URL=...
+HIVE_MIND_API_KEY=...
+LLM_MODEL=...
+LLM_BASE_URL=...
+```
 
-`[REVIEW]` Confirm `envcrypt.js` supports the CLI shape used in `entrypoint.sh`. If not, ELEVATE — do not silently substitute.
+Risk posture: secret on host disk at mode 600. Attacker with host root reads it. No image-layer leakage. `docker inspect` does NOT reveal contents (no `env_file` directive used).
+
+### Future hardening — `envcrypt.js` in-process decryption
+
+The repo already supports per-key encryption via `envcrypt.js`. Model (verified 2026-05-18 by reading `/data/repos/charsme/meridian/envcrypt.js`):
+
+- `.env` itself is the source-of-truth file. It contains mixed plaintext and base64-encrypted entries.
+- Each encrypted entry is preceded by a `# encrypted` marker line. Example:
+  ```
+  TELEGRAM_BOT_TOKEN=plain-here
+  # encrypted
+  WALLET_PRIVATE_KEY=base64xxxx
+  ```
+- Passphrase lookup order at boot: `process.env.ENVRYPT_KEY` → `process.env.ENVCRYPT_KEY` → `./.envrypt` file (passphrase as plaintext). Minimum 8 chars enforced.
+- `loadEnv()` decrypts marked entries IN PROCESS at module load. No external CLI step needed.
+
+To enable for a deployed container:
+
+1. On host: `cd /path/to/repo && cp /data/volume/meridian/.env ./.env.raw && ENVRYPT_KEY=<chosen-passphrase> node scripts/envrypt.js encrypt .env.raw .env.encrypted`.
+2. Replace `/data/volume/meridian/.env` with `.env.encrypted` (renamed to `.env`).
+3. Provide passphrase via compose `environment: ENVRYPT_KEY: "${ENVRYPT_KEY}"` (pass through from operator shell at `docker compose up`); OR drop a `/data/volume/meridian/.envrypt` file containing only the passphrase line (mode 600) and add an entrypoint symlink to `/app/.envrypt`.
+4. Verify boot: `docker compose logs trader` should show the agent starting without "no envrypt key" errors.
+
+Risks: passphrase still on host (either in shell history or in `.envrypt`). Defense in depth limited but stronger than plain — an attacker who only steals the `.env` cannot use it without the separate passphrase channel.
+
+`[REVIEW]` Confirm operator wants v1 to ship with plain `.env` and harden later, vs. enable encryption from day one. Default proposed: plain v1 → harden after first stable deploy.
 
 ---
 
@@ -400,23 +471,29 @@ Same approach for `logs/` → `/var/log/meridian`.
 # One-time host prep
 sudo mkdir -p /data/volume/meridian /data/logs/meridian
 sudo chown -R 1000:1000 /data/volume/meridian /data/logs/meridian
-# place .envrypt and .envrypt-key.env into /data/volume/meridian, chmod 600
+sudo chmod 700 /data/volume/meridian
+sudo install -m 600 -o 1000 -g 1000 /dev/null /data/volume/meridian/.env
+sudoedit /data/volume/meridian/.env   # paste secrets, save
 
 # Build
 TAG=$(git rev-parse --short HEAD)
-echo "MERIDIAN_TAG=$TAG" > .env       # next to docker-compose.yml
-docker compose build
+echo "MERIDIAN_TAG=$TAG" > .env.stack  # next to docker-compose.yml
+                                       # named .env.stack to avoid colliding with the
+                                       # repo's app-level .env handling
+docker compose --env-file .env.stack build
 
 # Run
-docker compose up -d
+docker compose --env-file .env.stack up -d
 
 # Logs
 docker compose logs -f trader
 docker compose logs -f discord-listener
 
 # Stop
-docker compose down                   # state persists on /data/volume/meridian
+docker compose down                    # state persists on /data/volume/meridian
 ```
+
+`[REVIEW]` The compose stack `.env` lives at the repo root and would collide with Meridian's app `.env`. Spec uses `.env.stack` with `--env-file .env.stack` to disambiguate. Add `.env.stack` to `.gitignore`.
 
 Rollback:
 
@@ -442,8 +519,8 @@ docker compose up -d                  # re-pulls/builds previous tag
    sudo cp -a /path/to/repo/logs/* /data/logs/meridian/ 2>/dev/null || true
    sudo chown -R 1000:1000 /data/volume/meridian /data/logs/meridian
    ```
-4. Encrypt `.env` with `envcrypt.js`, place at `/data/volume/meridian/.envrypt`. Create `.envrypt-key.env`.
-5. `docker compose up -d`.
+4. Copy plain `.env` from host repo into the volume: `sudo install -m 600 -o 1000 -g 1000 /path/to/repo/.env /data/volume/meridian/.env`. (Skip the encryption step for v1; see §9 to harden later.)
+5. `docker compose --env-file .env.stack up -d`.
 6. Watch `docker compose logs -f trader` for the first management cycle. Confirm `state.json` mtime updates → healthcheck stays green.
 
 ELEVATE if any state file is held open by the PM2 process during copy. Prefer stopping PM2 fully first; never copy a live-written JSON.
@@ -452,14 +529,34 @@ ELEVATE if any state file is held open by the PM2 process during copy. Prefer st
 
 ## 13. Open Items / ELEVATE Before Implementing
 
-1. `envcrypt.js` CLI shape — verify `decrypt --file --key --format export` works, OR rewrite `entrypoint.sh` to match the actual CLI. Do NOT assume.
+1. ~~`envcrypt.js` CLI shape~~ **RESOLVED 2026-05-18.** Verified per-key inline model. v1 spec uses plain `.env`; encryption is opt-in hardening (see §9). Decision: ship v1 with plain `.env`, harden later.
 2. Trader CPU limit `1.5` — measure actual usage in a non-prod run for ≥24h before locking. May need to bump to 2 if RPC concurrency saturates.
 3. `NODE_OPTIONS=--max-old-space-size=1536` — assumes 2G hard / 1.5G soft. Re-tune if mem caps change.
-4. Healthcheck threshold `30 min` — assumes `managementIntervalMin` defaults around 10 min. If the operator sets a longer interval, the healthcheck false-positives. Read `managementIntervalMin` from config or widen threshold. ELEVATE.
+4. ~~Healthcheck threshold~~ **RESOLVED 2026-05-18.** `docker/healthcheck.js` reads `managementIntervalMin` from `/data/user-config.json` and uses `max(2 × interval, 30) min`. Operator can override via `HEALTHCHECK_STALE_MIN` env in compose. No more false positives on long intervals.
 5. `discord-signals.json` write semantics — confirm listener writes are atomic (rename-over) so trader doesn't read a half-written file. If non-atomic, add file locking or switch to a named pipe. ELEVATE if unclear.
 6. Whether `discord-listener` should be allowed to crash without restarting `trader` — current compose has `depends_on` only for start ordering, not restart coupling. Confirm OK.
 7. CI: building images on every commit vs operator-triggered. Out of this spec; add a `.github/workflows/build.yml` separately when CI is wanted.
 8. Backup story for `/data/volume/meridian` — nightly tarball to remote? Out of this spec but ELEVATE: losing this volume = lobotomizing the agent.
+
+## 13b. Future Improvement — Nano-Webhook Wiring
+
+`[PLANNED, not in v1 scope]` Operator wants Meridian to publish events to Nano (the same channel used by the `nano-reminder` skill which polls a queue file every 15 min and turns entries into Telegram pings). Goal: push trade events (deploy, close, OOR, threshold-evolution, claim) out of the trader's local Telegram notifier and into Nano so they aggregate with other Nano-driven alerts under one operator UI.
+
+Open questions to ELEVATE before designing:
+- Direction: Meridian → Nano (push) only, or also Nano → Meridian (commands)? Today Telegram is bidirectional (commands like `/positions`, `/close`).
+- Nano-webhook surface: HTTP POST endpoint? Queue file path? Telegram bot impersonation? Operator must specify.
+- Auth: bearer token? Shared secret in `.env`? loreKeeper-issued agent key (`mcp__lorekeeper-local__create_agent_key`)?
+- Failure mode: if Nano is down, does the trader queue events locally and replay, or drop?
+- Coexistence with the existing Telegram notifier — replace or run in parallel? Migration story.
+- Does this require an external HTTP endpoint on Meridian (for Nano → Meridian commands)? If yes, revisit Traefik decision from §1.
+
+Implementation sketch when revived:
+- Add `nano: { enabled, baseUrl, apiKey, channels: [...] }` block to config.
+- `telegram.js` already centralizes outbound notifications; add a parallel `nano.js` notifier behind `if (config.nano?.enabled)`.
+- Events to push: `position_opened`, `position_closed`, `oor_detected`, `fees_claimed`, `threshold_evolved`, `cooldown_triggered`.
+- Best-effort fire-and-forget with a short retry queue in memory. Never block the trade path on Nano availability.
+
+Park as separate spec (`docs/nano-webhook-integration.md`) when operator is ready to scope it. Trigger to start: operator provides the Nano endpoint contract.
 
 ---
 
@@ -467,8 +564,10 @@ ELEVATE if any state file is held open by the PM2 process during copy. Prefer st
 
 - [ ] `docker compose ps` shows both `trader` and `discord-listener` `healthy`.
 - [ ] `docker compose exec trader ls -l /data/state.json` shows recent mtime.
-- [ ] `docker compose exec trader env | grep -E 'WALLET|RPC|OPENROUTER'` confirms env loaded.
-- [ ] `docker compose exec trader env | grep ENVCRYPT_KEY` returns EMPTY (passphrase unset post-decrypt).
+- [ ] `docker compose exec trader ls -l /app/.env` shows it is a symlink → `/data/.env`.
+- [ ] `docker compose exec trader env | grep -E 'WALLET|RPC|OPENROUTER'` confirms env loaded (values masked in real check).
+- [ ] (v1 only) `docker compose exec trader env | grep -E 'ENVRYPT_KEY|ENVCRYPT_KEY'` returns EMPTY — confirms no passphrase needed.
+- [ ] `docker compose exec trader node -e "console.log(JSON.parse(require('fs').readFileSync('/data/user-config.json')).schedule?.managementIntervalMin ?? JSON.parse(require('fs').readFileSync('/data/user-config.json')).managementIntervalMin)"` returns a number — confirms healthcheck can read the interval.
 - [ ] Telegram `/positions` command responds.
 - [ ] Force a screening cycle (REPL or wait for cron); confirm `state.json` mtime updates and no errors in `docker compose logs trader`.
 - [ ] Stop and restart: `docker compose down && docker compose up -d`. Confirm `state.json` is preserved and the agent resumes without re-deploying duplicate positions.
