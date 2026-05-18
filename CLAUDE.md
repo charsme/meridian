@@ -224,3 +224,53 @@ Agent Meridian HiveMind sync is handled by `hivemind.js`. It uses built-in Agent
 
 ## Known Issues / Tech Debt
 - _None._ `get_wallet_positions` is intentionally GENERAL-only — it inspects arbitrary external wallets for chat use, not the agent's own wallet (that's `get_my_positions`).
+
+---
+
+## TODO
+
+### Containerize (Dockerfile + docker-compose)
+
+Currently runs native (Node 18+ via PM2, see `ecosystem.config.cjs`). To containerize cleanly, the following constraints must be addressed:
+
+**Persistent state — must be volume-mounted, not baked into image:**
+- `user-config.json` — mutated at runtime by the `update_config` tool
+- `state.json` — open position registry (canonical source of truth)
+- `lessons.json` — learning data; thresholds evolve from it
+- `pool-memory.json` — per-pool deploy history + snapshots
+- `strategy-library.json` — saved LP strategies
+- `smart-wallets.json` — KOL/alpha wallet tracker
+- `token-blacklist.json`, `deployer-blacklist.json`, `dev-blocklist.json` — permanent block lists
+- `signal-weights.json`, `decision-log.json`, `hivemind-cache.json` — auxiliary state
+- `logs/` directory — daily-rotating logs + `actions-*.jsonl` audit trail
+
+**Working-directory contract:**
+- Code mixes `path.join(__dirname, "foo.json")` (anchored) with `"./foo.json"` (cwd-relative, e.g. `state.js:14`, `lessons.js:18`, `pool-memory.js:12`). Container `WORKDIR` MUST equal the app dir so cwd-relative writes land on the volume, not in `/`.
+
+**Two-process layout:**
+- `discord-listener/` is a separate Node app with its own `package.json` and deps (`discord.js-selfbot-v13`, `axios`). Choose: sibling container in compose, OR single image with a supervisor (`tini` + `concurrently` / `supervisord`). Sibling container is cleaner.
+
+**Build step:**
+- `postinstall` runs `scripts/patch-anchor.js` which patches `node_modules/@coral-xyz/anchor`. Patch must run inside the build stage AFTER `npm ci`, BEFORE copying `node_modules` into the runtime stage (or run `npm ci` in the runtime stage).
+
+**Process management:**
+- Drop PM2 inside the container. Use `node index.js` as PID 1 with `tini`/`dumb-init` for proper signal forwarding. Container restart policy (`unless-stopped`) replaces PM2 autorestart. Graceful shutdown already handles `SIGINT`/`SIGTERM` (see `index.js:844-871`).
+
+**Secrets:**
+- `WALLET_PRIVATE_KEY` MUST never be baked into the image layer. Inject via env (compose `env_file`, K8s secret, or Docker secret). Same for `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `HELIUS_API_KEY`, `HIVE_MIND_API_KEY`.
+- `envcrypt.js` supports encrypted env files — pick one delivery model (plain `.env` mount vs. encrypted-at-rest with passphrase) and document it.
+
+**Network:**
+- Outbound only (Solana RPC, OpenRouter, Jupiter, Telegram long-poll, Helius). No exposed ports. No need for an ingress network.
+
+**Timezone:**
+- `node-cron` schedules use container TZ. Pin via `TZ` env to keep `screeningIntervalMin` / `managementIntervalMin` aligned with operator's expectations.
+
+**Image:**
+- Base on `node:20-bookworm-slim` (slim, has `python3`/`make` for any native gyp builds Solana deps need) or `node:20-alpine` (smaller, may need `apk add python3 make g++ libc6-compat` for `bs58`/`bn.js` builds). Multi-stage: `builder` runs `npm ci` + anchor patch, `runtime` copies `node_modules` + source.
+
+**Healthcheck:**
+- No HTTP endpoint exists. Either add a `/healthz` in `index.js` for container probes, or use a `node -e "fs.statSync('state.json')"` cmd-style healthcheck.
+
+**Out of scope (do not add):**
+- Database service. Repo is file-state-only — no SQL/NoSQL dependency, no migration story needed.
