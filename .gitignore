@@ -31,7 +31,8 @@ logs/
 context.md
 CONTEXT.md
 dev-blocklist.json
-docs/
+docs/*
+!docs/lorekeeper-integration.md
 
 # Discord listener queue
 discord-signals.json

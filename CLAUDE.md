@@ -274,3 +274,7 @@ Currently runs native (Node 18+ via PM2, see `ecosystem.config.cjs`). To contain
 
 **Out of scope (do not add):**
 - Database service. Repo is file-state-only — no SQL/NoSQL dependency, no migration story needed.
+
+### loreKeeper Semantic-Recall Integration (deferred)
+
+Spec parked at `docs/lorekeeper-integration.md`. Augments the English text-lesson layer with semantic retrieval via the loreKeeper MCP store (namespace `private/trading`). Keeps numeric feedback loops local. Best-effort with local fallback. Opt-in via `config.lorekeeper.enabled`. Trigger condition to start: 100+ closes accumulated AND multi-agent HiveMind, OR explicit operator request.
